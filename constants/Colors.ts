@@ -1,0 +1,18 @@
+export const Colors = {
+  background: '#070708',
+  surface: '#0f0f10',
+  card: '#141416',
+  cardElevated: '#1a1a1d',
+  border: 'rgba(255,255,255,0.06)',
+  borderStrong: 'rgba(255,255,255,0.10)',
+  text: '#FAFAFA',
+  textMuted: '#A3A3A3',
+  subtext: '#525252',
+  accent: '#FFFFFF',
+  accentLight: '#AAAAAA',
+  accentGlow: 'rgba(255,255,255,0.12)',
+  holiday: '#737373',
+  event: '#FFFFFF',
+  overlay: 'rgba(0,0,0,0.55)',
+  pillBg: 'rgba(255,255,255,0.06)',
+};

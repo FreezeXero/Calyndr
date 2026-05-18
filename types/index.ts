@@ -21,4 +21,8 @@ export interface CalEvent {
   /** For appointments */
   person?: string;
   isHoliday?: boolean;
+  /** When the entry was saved to Calyndr (ms since epoch) */
+  createdAt?: number;
+  /** Starred in Upcoming */
+  favorite?: boolean;
 }

@@ -22,9 +22,11 @@ type EventCardProps = {
   event: CalEvent;
   /** `list` = week/upcoming rows; `modal` = month day picker popup */
   variant?: 'list' | 'modal';
+  /** Called before navigating (e.g. close month modal) */
+  onBeforeNavigate?: () => void;
 };
 
-export default function EventCard({ event, variant = 'list' }: EventCardProps) {
+export default function EventCard({ event, variant = 'list', onBeforeNavigate }: EventCardProps) {
   const router = useRouter();
   const [thumbTier, setThumbTier] = useState<'direct' | 'stock' | 'gone'>('stock');
 
@@ -79,7 +81,10 @@ export default function EventCard({ event, variant = 'list' }: EventCardProps) {
   return (
     <TouchableOpacity
       style={[styles.card, webListStyle && styles.cardWeb, webModalStyle && styles.cardModalWeb]}
-      onPress={() => router.push(`/event/${encodeURIComponent(String(event.id))}`)}
+      onPress={() => {
+        onBeforeNavigate?.();
+        router.push(`/event/${encodeURIComponent(String(event.id))}`);
+      }}
       activeOpacity={0.72}
     >
       <View style={[styles.dateRail, webListStyle && styles.dateRailWeb, webModalStyle && styles.dateRailModalWeb]}>

@@ -13,7 +13,7 @@ import {
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { Colors } from '@/constants/Colors';
-import { saveEvent } from '@/lib/storage';
+import { generateId, saveEvent } from '@/lib/storage';
 import { CalEvent, EntryType } from '@/types';
 import { scheduleEventReminder } from '@/lib/notifications';
 import WebPage from '@/components/WebPage';
@@ -58,7 +58,7 @@ export default function NewEventScreen() {
       return;
     }
 
-    const id = `local-${Date.now()}`;
+    const id = generateId();
     const event: CalEvent = {
       id,
       type: entryType,

@@ -14,7 +14,20 @@ import * as ImagePicker from 'expo-image-picker';
 import { Image } from 'expo-image';
 import { Colors } from '@/constants/Colors';
 import { saveEvent } from '@/lib/storage';
-import { sendNexaTextMessage, sendNexaImageMessage, parseEventFromUrl } from '@/lib/claude';
+import {
+  sendNexaChat,
+  parseEventFromUrl,
+  type NexaApiMessage,
+  type NexaResult,
+  type NexaUserContent,
+} from '@/lib/claude';
+import {
+  imageBlockFromBase64,
+  inferImageMediaType,
+  normalizeBase64Image,
+  type AnthropicImageMediaType,
+} from '@/lib/imageMime';
+import { saveEventImageFromBase64 } from '@/lib/eventImageStore';
 import { scheduleEventReminder } from '@/lib/notifications';
 import type { CalEvent } from '@/types';
 import WebPage from '@/components/WebPage';
@@ -26,7 +39,10 @@ interface Message {
   text: string;
   success?: boolean;
   imageUrl?: string;
+  localImageUri?: string;
 }
+
+type PendingImage = { base64: string; uri: string; mediaType: AnthropicImageMediaType };
 
 const SUGGESTIONS = [
   { label: 'Add an event', icon: 'calendar-outline' as const },
@@ -69,12 +85,18 @@ export default function NexaScreen() {
       role: 'nexa',
       text: KEY_MISSING
         ? "Hey! I'm Nexa. Add your Anthropic API key to .env.local to get started."
-        : "Hi — I'm Nexa. Paste an event URL to import it, describe something to add to your calendar, or ask me anything about networking and career events.",
+        : "Hey! I'm Nexa. Paste an event URL, describe an event, or ask me anything about scheduling.",
     },
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
   const listRef = useRef<FlatList>(null);
+  const apiHistoryRef = useRef<NexaApiMessage[]>([]);
+  /** Last photo the user sent — reused when they confirm "add both" in a later message. */
+  const lastUploadImageRef = useRef<PendingImage | null>(null);
+
+  const sourceImageForTurn = (explicit?: PendingImage | null) => explicit ?? lastUploadImageRef.current;
 
   const scrollEnd = () => setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
 
@@ -83,19 +105,105 @@ export default function NexaScreen() {
     scrollEnd();
   };
 
-  const persistEvent = async (event: CalEvent) => {
-    await saveEvent(event);
+  const attachUploadImage = async (event: CalEvent, source?: PendingImage | null): Promise<CalEvent> => {
+    if (!source) return event;
+    const uri = await saveEventImageFromBase64(
+      event.id,
+      source.base64,
+      source.mediaType,
+      source.uri,
+    );
+    return { ...event, imageUrl: uri, hostImage: uri };
+  };
+
+  const persistEvent = async (event: CalEvent, sourceImage?: PendingImage | null) => {
+    const stored = await attachUploadImage(event, sourceImage);
+    await saveEvent(stored);
     await scheduleEventReminder({
-      id: event.id,
-      title: event.title,
-      date: event.date,
-      startTime: event.startTime,
+      id: stored.id,
+      title: stored.title,
+      date: stored.date,
+      startTime: stored.startTime,
     });
+    return stored;
+  };
+
+  const recordApiTurn = (userContent: NexaUserContent, assistantText: string) => {
+    if (!assistantText.trim()) return;
+    const turn: NexaApiMessage[] = [
+      { role: 'user', content: userContent },
+      { role: 'assistant', content: assistantText },
+    ];
+    apiHistoryRef.current = [...apiHistoryRef.current, ...turn].slice(-24);
+  };
+
+  const applyNexaResult = async (result: NexaResult, sourceImage?: PendingImage | null) => {
+    try {
+      if (result.kind === 'event') {
+        const stored = await persistEvent(result.event, sourceImage);
+        push({
+          id: `${Date.now()}-ok`,
+          role: 'nexa',
+          text: `Added "${stored.title}" on ${stored.date} at ${formatTime(stored.startTime)}${stored.location ? ` · ${stored.location}` : ''}.`,
+          success: true,
+          imageUrl: stored.imageUrl,
+        });
+        return;
+      }
+      if (result.kind === 'events') {
+        let firstThumb: string | undefined;
+        for (const ev of result.events) {
+          const stored = await persistEvent(ev, sourceImage);
+          if (!firstThumb && stored.imageUrl) firstThumb = stored.imageUrl;
+        }
+        const names = result.events.map(e => `"${e.title}"`).join(', ');
+        push({
+          id: `${Date.now()}-multi`,
+          role: 'nexa',
+          text: `Added ${result.events.length} events: ${names}.`,
+          success: true,
+          imageUrl: firstThumb,
+        });
+        return;
+      }
+    } catch (e) {
+      push({
+        id: `${Date.now()}-save-err`,
+        role: 'nexa',
+        text: e instanceof Error ? e.message : 'Could not save to your calendar.',
+      });
+      return;
+    }
+    if (result.kind === 'chat') {
+      push({ id: `${Date.now()}-c`, role: 'nexa', text: result.text });
+      return;
+    }
+    push({ id: `${Date.now()}-e`, role: 'nexa', text: result.message });
+  };
+
+  const runNexaChat = async (userContent: NexaUserContent, sourceImage?: PendingImage | null) => {
+    const messages: NexaApiMessage[] = [...apiHistoryRef.current, { role: 'user', content: userContent }];
+    const { result, assistantText } = await sendNexaChat(messages);
+
+    const historyReply =
+      assistantText ||
+      (result.kind === 'chat'
+        ? result.text
+        : result.kind === 'error'
+          ? result.message
+          : result.kind === 'event'
+            ? `{"type":"event","title":"${result.event.title}","date":"${result.event.date}"}`
+            : result.kind === 'events'
+              ? `Added ${result.events.length} events.`
+              : '');
+
+    recordApiTurn(userContent, historyReply);
+    await applyNexaResult(result, sourceImageForTurn(sourceImage));
   };
 
   const handleSendText = async (textRaw: string) => {
     const text = textRaw.trim();
-    if (!text || loading) return;
+    if ((!text && !pendingImage) || loading) return;
 
     const URL_RE = /https?:\/\/[^\s]+/;
     const urlMatch = text.match(URL_RE);
@@ -116,21 +224,25 @@ export default function NexaScreen() {
         const imported = await parseEventFromUrl(pageUrl);
 
         if (imported) {
-          await persistEvent(imported);
+          const stored = await persistEvent(imported);
+          const okText = `Done! Added "${stored.title}" on ${stored.date} at ${formatTime(stored.startTime)}${stored.location ? ` · ${stored.location}` : ''}.`;
           push({
             id: `${Date.now()}-ok`,
             role: 'nexa',
-            text: `Done! Added "${imported.title}" on ${imported.date} at ${formatTime(imported.startTime)}${imported.location ? ` · ${imported.location}` : ''}.`,
+            text: okText,
             success: true,
-            imageUrl: imported.imageUrl,
+            imageUrl: stored.imageUrl,
           });
+          recordApiTurn(text, okText);
         } else {
-          push({
-            id: `${Date.now()}-fail`,
-            role: 'nexa',
-            text: "Couldn't read that page — it might require a login. Try pasting the event details instead.",
-          });
+          const failText = "Couldn't read that page — it might require a login. Try pasting the event details instead.";
+          push({ id: `${Date.now()}-fail`, role: 'nexa', text: failText });
+          recordApiTurn(text, failText);
         }
+      } catch (e) {
+        const errText = e instanceof Error ? e.message : 'Could not save to your calendar.';
+        push({ id: `${Date.now()}-save-err`, role: 'nexa', text: errText });
+        recordApiTurn(text, errText);
       } finally {
         setLoading(false);
       }
@@ -140,35 +252,53 @@ export default function NexaScreen() {
 
     if (KEY_MISSING) return;
 
-    push({ id: `${Date.now()}-u`, role: 'user', text });
+    const image = pendingImage;
+    if (image) lastUploadImageRef.current = image;
+    const caption = text;
+    const userLabel = image
+      ? caption || 'Sent a photo'
+      : text;
+
+    push({
+      id: `${Date.now()}-u`,
+      role: 'user',
+      text: userLabel,
+      ...(image ? { localImageUri: image.uri } : {}),
+    });
     setInput('');
+    setPendingImage(null);
     setLoading(true);
 
-    const result = await sendNexaTextMessage(text);
-    setLoading(false);
+    const userContent: NexaUserContent = image
+      ? [
+          imageBlockFromBase64(image.base64, image.uri, image.mediaType),
+          {
+            type: 'text',
+            text:
+              caption ||
+              'What events do you see in this image? List each with title, date, and time. Ask before adding to my calendar.',
+          },
+        ]
+      : text;
 
-    if (result.kind === 'event') {
-      await persistEvent(result.event);
-      push({
-        id: `${Date.now()}-ok`,
-        role: 'nexa',
-        text: `Added "${result.event.title}" on ${result.event.date} at ${formatTime(result.event.startTime)}${result.event.location ? ` · ${result.event.location}` : ''}.`,
-        success: true,
-        imageUrl: result.event.imageUrl,
-      });
-      scrollEnd();
-      return;
+    try {
+      await runNexaChat(userContent, sourceImageForTurn(image));
+    } finally {
+      setLoading(false);
     }
-    if (result.kind === 'chat') {
-      push({ id: `${Date.now()}-c`, role: 'nexa', text: result.text });
-      scrollEnd();
-      return;
-    }
-    push({ id: `${Date.now()}-e`, role: 'nexa', text: result.message });
     scrollEnd();
   };
 
-  const handleSend = async () => handleSendText(input);
+  const canSend = Boolean((input.trim() || pendingImage) && !KEY_MISSING && !loading);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (pendingImage) {
+      await handleSendText(text);
+      return;
+    }
+    if (text) await handleSendText(text);
+  };
 
   const handleImage = async () => {
     if (KEY_MISSING || loading) return;
@@ -177,32 +307,28 @@ export default function NexaScreen() {
       base64: true,
       quality: 0.5,
     });
-    if (result.canceled || !result.assets[0].base64) return;
+    if (result.canceled) return;
+    const asset = result.assets?.[0];
+    if (!asset?.base64) return;
+    const uri = asset.uri ?? '';
+    const pickerMime =
+      'mimeType' in asset && typeof asset.mimeType === 'string' ? asset.mimeType : null;
+    const normalized = normalizeBase64Image(asset.base64);
+    setPendingImage({
+      base64: normalized.data,
+      uri,
+      mediaType: normalized.mediaType ?? inferImageMediaType(uri, pickerMime),
+    });
+  };
 
-    push({ id: `${Date.now()}-img`, role: 'user', text: '📸 Uploaded an image' });
-    setLoading(true);
-
-    const reply = await sendNexaImageMessage(result.assets[0].base64);
-    setLoading(false);
-
-    if (reply.kind === 'event') {
-      await persistEvent(reply.event);
-      push({
-        id: `${Date.now()}-img-ok`,
-        role: 'nexa',
-        text: `Added "${reply.event.title}" on ${reply.event.date} at ${formatTime(reply.event.startTime)}${reply.event.location ? ` · ${reply.event.location}` : ''}.`,
-        success: true,
-      });
-      scrollEnd();
-      return;
+  const handleComposerKeyPress = (
+    e: { nativeEvent: { key: string; shiftKey?: boolean }; preventDefault?: () => void },
+  ) => {
+    if (!isWeb) return;
+    if (e.nativeEvent.key === 'Enter' && !e.nativeEvent.shiftKey) {
+      e.preventDefault?.();
+      if (canSend) void handleSend();
     }
-    if (reply.kind === 'chat') {
-      push({ id: `${Date.now()}-img-c`, role: 'nexa', text: reply.text });
-      scrollEnd();
-      return;
-    }
-    push({ id: `${Date.now()}-img-e`, role: 'nexa', text: reply.message });
-    scrollEnd();
   };
 
   const renderMessage = ({ item, index }: { item: Message; index: number }) => {
@@ -221,6 +347,9 @@ export default function NexaScreen() {
             </View>
           ) : null}
           <View style={[styles.bubble, isUser ? styles.userBubble : styles.nexaBubble]}>
+            {item.localImageUri ? (
+              <Image source={{ uri: item.localImageUri }} style={styles.userAttachThumb} contentFit="cover" transition={180} />
+            ) : null}
             {item.imageUrl ? (
               <Image source={{ uri: item.imageUrl }} style={styles.successThumb} contentFit="cover" transition={180} />
             ) : null}
@@ -288,6 +417,23 @@ export default function NexaScreen() {
           ) : null}
 
           <View style={styles.composer}>
+            {pendingImage ? (
+              <View style={styles.attachPreview}>
+                <Image source={{ uri: pendingImage.uri }} style={styles.attachPreviewImg} contentFit="cover" />
+                <View style={styles.attachPreviewMeta}>
+                  <Text style={styles.attachPreviewLabel}>Image attached</Text>
+                  <Text style={styles.attachPreviewSub}>Add a message, then send</Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.attachRemove}
+                  onPress={() => setPendingImage(null)}
+                  hitSlop={8}
+                  accessibilityLabel="Remove image"
+                >
+                  <Ionicons name="close" size={20} color={Colors.textMuted} />
+                </TouchableOpacity>
+              </View>
+            ) : null}
             <View style={styles.inputRow}>
               <TouchableOpacity
                 style={styles.iconBtn}
@@ -300,21 +446,28 @@ export default function NexaScreen() {
                 style={styles.input}
                 value={input}
                 onChangeText={setInput}
-                placeholder={KEY_MISSING ? 'Add API key to .env.local first…' : 'Message Nexa or paste an event link…'}
+                placeholder={
+                  KEY_MISSING
+                    ? 'Add API key to .env.local first…'
+                    : pendingImage
+                      ? 'Add a note (optional)…'
+                      : 'Message Nexa or paste an event link…'
+                }
                 placeholderTextColor={Colors.subtext}
                 multiline
                 editable={!KEY_MISSING && !loading}
-                onSubmitEditing={isWeb ? () => void handleSend() : undefined}
+                blurOnSubmit={false}
+                onKeyPress={handleComposerKeyPress}
               />
               <TouchableOpacity
-                style={[styles.sendBtn, (!input.trim() || KEY_MISSING || loading) && styles.sendBtnDisabled]}
+                style={[styles.sendBtn, !canSend && styles.sendBtnDisabled]}
                 onPress={() => void handleSend()}
-                disabled={!input.trim() || KEY_MISSING || loading}
+                disabled={!canSend}
               >
                 <Ionicons
                   name="arrow-up"
                   size={24}
-                  color={input.trim() && !KEY_MISSING && !loading ? Colors.background : Colors.subtext}
+                  color={canSend ? Colors.background : Colors.subtext}
                 />
               </TouchableOpacity>
             </View>
@@ -439,6 +592,14 @@ const styles = StyleSheet.create({
   userText: { color: Colors.background },
 
   successRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  userAttachThumb: {
+    width: '100%',
+    maxWidth: 220,
+    height: 140,
+    borderRadius: 12,
+    backgroundColor: Colors.card,
+    marginBottom: 6,
+  },
   successThumb: {
     width: 56,
     height: 56,
@@ -447,6 +608,29 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
     marginBottom: 4,
+  },
+  attachPreview: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 10,
+    padding: 10,
+    borderRadius: 14,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  attachPreviewImg: { width: 52, height: 52, borderRadius: 10 },
+  attachPreviewMeta: { flex: 1, gap: 2 },
+  attachPreviewLabel: { color: Colors.text, fontSize: 14, fontWeight: '600' },
+  attachPreviewSub: { color: Colors.subtext, fontSize: 12 },
+  attachRemove: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.card,
   },
   successLabel: { color: SUCCESS_GREEN, fontSize: 13, fontWeight: '600' },
 

@@ -79,25 +79,32 @@ export function entryLetterThumbnail(title: string): { bg: string; letter: strin
 export function titleLetterThumbnail(title: string): { bg: string; letter: string } {
   return entryLetterThumbnail(title);
 }
-export function eventHasHostedImage(event: Pick<CalEvent, 'hostImage' | 'imageUrl'>): boolean {
-  return (
-    (typeof event.imageUrl === 'string' && event.imageUrl.startsWith('http')) ||
-    (typeof event.hostImage === 'string' && event.hostImage.startsWith('http'))
-  );
+function isStoredEventImage(u: string): boolean {
+  const t = u.trim();
+  if (t.startsWith('http://') || t.startsWith('https://') || t.startsWith('file://')) return true;
+  if (t.startsWith('data:image/')) return true;
+  if (t.startsWith('/') && !t.startsWith('//')) return true;
+  return false;
 }
 
-/** Scraped og:image or other explicit remote art (not city-based stock). */
+export function eventHasHostedImage(event: Pick<CalEvent, 'hostImage' | 'imageUrl'>): boolean {
+  const i = event.imageUrl?.trim();
+  const h = event.hostImage?.trim();
+  return Boolean((i && isStoredEventImage(i)) || (h && isStoredEventImage(h)));
+}
+
+/** User upload, scraped og:image, or other explicit art (not city-based stock). */
 export function eventDirectImageUrl(event: Pick<CalEvent, 'imageUrl' | 'hostImage'>): string {
   const i = event.imageUrl?.trim();
-  if (i?.startsWith('http')) return i;
+  if (i && isStoredEventImage(i)) return i;
   const h = event.hostImage?.trim();
-  if (h?.startsWith('http')) return h;
+  if (h && isStoredEventImage(h)) return h;
   return '';
 }
 
 export function getEventCoverUri(event: CalEvent): string | undefined {
-  if (event.imageUrl?.startsWith('http')) return event.imageUrl.trim();
-  if (event.hostImage?.startsWith('http')) return event.hostImage.trim();
+  const direct = eventDirectImageUrl(event);
+  if (direct) return direct;
 
   const hay = `${event.city ?? ''} ${event.location ?? ''} ${event.title ?? ''}`.toLowerCase();
   for (const { match, uri } of CITY_COVER) {

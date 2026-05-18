@@ -1,4 +1,5 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
+import { subscribeEventsChanged } from '@/lib/eventsRefresh';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView, FlatList, Modal, Platform, Pressable,
 } from 'react-native';
@@ -12,6 +13,7 @@ import { HOLIDAYS_2026 } from '@/constants/Holidays';
 import EventCard from '@/components/EventCard';
 import WebPage from '@/components/WebPage';
 import { isWeb } from '@/constants/layout';
+import { supabase } from '@/lib/supabase';
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -38,10 +40,34 @@ export default function CalendarScreen() {
   const [events, setEvents] = useState<CalEvent[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
   const [modalDay, setModalDay] = useState<number | null>(null);
+  const [userName, setUserName] = useState('');
+
+  useEffect(() => {
+    const loadName = () => {
+      supabase.auth.getUser().then(({ data: { user } }) => {
+        if (!user) {
+          setUserName('');
+          return;
+        }
+        const full = user.user_metadata?.full_name || user.user_metadata?.name || user.email || '';
+        const first = full.includes('@') ? full.split('@')[0] : full.split(' ')[0];
+        setUserName(first);
+      });
+    };
+    loadName();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(loadName);
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const loadEvents = useCallback(() => {
+    getEvents().then(stored => setEvents([...stored, ...HOLIDAYS_2026]));
+  }, []);
 
   useFocusEffect(useCallback(() => {
-    getEvents().then(stored => setEvents([...stored, ...HOLIDAYS_2026]));
-  }, []));
+    loadEvents();
+  }, [loadEvents]));
+
+  useEffect(() => subscribeEventsChanged(loadEvents), [loadEvents]);
 
   const toDateStr = (d: Date) =>
     `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -91,10 +117,16 @@ export default function CalendarScreen() {
         {/* Header */}
         <View style={[styles.header, isWeb && styles.headerWeb]}>
           <View>
-            <Text style={[styles.greeting, isWeb && styles.greetingWeb]}>{greeting()}, Rafay</Text>
+            <Text style={[styles.greeting, isWeb && styles.greetingWeb]}>
+              {userName ? `${greeting()}, ${userName}` : greeting()}
+            </Text>
             <Text style={[styles.todayLabel, isWeb && styles.todayLabelWeb]}>{today.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</Text>
           </View>
-          <TouchableOpacity style={[styles.addBtn, isWeb && styles.addBtnWeb]} onPress={() => router.push('/new-event')}>
+          <TouchableOpacity
+            style={[styles.addBtn, isWeb && styles.addBtnWeb]}
+            onPress={() => router.push('/new-event')}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          >
             <Ionicons name="add" size={24} color={Colors.background} />
           </TouchableOpacity>
         </View>
@@ -255,7 +287,13 @@ export default function CalendarScreen() {
                 keyExtractor={e => e.id}
                 style={isWeb ? styles.sheetListWeb : undefined}
                 contentContainerStyle={[styles.sheetList, isWeb && styles.sheetListWebContent]}
-                renderItem={({ item }) => <EventCard event={item} variant="modal" />}
+                renderItem={({ item }) => (
+                  <EventCard
+                    event={item}
+                    variant="modal"
+                    onBeforeNavigate={() => setModalVisible(false)}
+                  />
+                )}
               />
             </View>
           </View>

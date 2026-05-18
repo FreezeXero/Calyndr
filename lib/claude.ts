@@ -3,6 +3,8 @@ import Constants from 'expo-constants';
 import { CalEvent } from '@/types';
 import { getEventCoverUri } from '@/lib/eventImagery';
 import { getNexaSystemPrompt } from '@/lib/nexaPrompt';
+import { isValidDate, isValidTime, parseEventDateStrict, parseEventTimeHHMM } from '@/lib/eventFormat';
+import { generateId } from '@/lib/storage';
 
 type AnthropicBody = {
   model: string;
@@ -13,8 +15,30 @@ type AnthropicBody = {
 
 export type NexaResult =
   | { kind: 'event'; event: CalEvent }
+  | { kind: 'events'; events: CalEvent[] }
   | { kind: 'chat'; text: string }
   | { kind: 'error'; message: string };
+
+import { imageBlockFromBase64, type AnthropicImageMediaType } from '@/lib/imageMime';
+
+export type NexaImageBlock = {
+  type: 'image';
+  source: { type: 'base64'; media_type: AnthropicImageMediaType; data: string };
+};
+
+export type NexaTextBlock = { type: 'text'; text: string };
+
+export type NexaUserContent = string | (NexaTextBlock | NexaImageBlock)[];
+
+export type NexaApiMessage = {
+  role: 'user' | 'assistant';
+  content: NexaUserContent;
+};
+
+export type NexaChatResponse = {
+  result: NexaResult;
+  assistantText: string;
+};
 
 function extractAssistantText(data: unknown): string | null {
   if (!data || typeof data !== 'object') return null;
@@ -80,35 +104,77 @@ function extractFirstJsonObject(s: string): string | null {
   return null;
 }
 
+function eventFromJsonPayload(json: EventJsonPayload, id?: string): CalEvent | null {
+  if (json.type !== 'event') return null;
+  if (typeof json.title !== 'string') return null;
+  if (json.date == null || (typeof json.date !== 'string' && typeof json.date !== 'number')) return null;
+
+  const dateRaw = String(json.date).trim();
+  if (dateRaw.toLowerCase() === 'unknown') return null;
+  const date = parseEventDateStrict(dateRaw);
+  if (!date) return null;
+
+  const startTime =
+    parseEventTimeHHMM(
+      typeof json.startTime === 'string' || typeof json.startTime === 'number'
+        ? String(json.startTime)
+        : '12:00',
+    ) ?? null;
+  const endTime =
+    parseEventTimeHHMM(
+      typeof json.endTime === 'string' || typeof json.endTime === 'number'
+        ? String(json.endTime)
+        : '14:00',
+    ) ?? null;
+  if (!startTime || !endTime || !isValidTime(startTime) || !isValidTime(endTime)) return null;
+
+  const eventId = id ?? generateId();
+  const loc = typeof json.location === 'string' && json.location.trim() ? json.location.trim() : undefined;
+  const city = typeof json.city === 'string' && json.city.trim() ? json.city.trim() : undefined;
+  const state = typeof json.state === 'string' && json.state.trim() ? json.state.trim() : undefined;
+  const desc = typeof json.description === 'string' && json.description.trim() ? json.description.trim() : undefined;
+  const base: CalEvent = {
+    id: eventId,
+    type: 'event',
+    title: json.title.trim(),
+    date,
+    startTime,
+    endTime,
+    isHoliday: false,
+    ...(loc ? { location: loc } : {}),
+    ...(city ? { city } : {}),
+    ...(state ? { state } : {}),
+    ...(desc ? { description: desc } : {}),
+  };
+  const uri = getEventCoverUri(base);
+  return uri ? { ...base, hostImage: uri } : base;
+}
+
 function tryParseEventPayload(clean: string): CalEvent | null {
   const t = clean.trim();
   const jsonSlice = extractFirstJsonObject(t);
   if (!jsonSlice) return null;
   try {
     const json = JSON.parse(jsonSlice) as EventJsonPayload;
-    if (json.type !== 'event') return null;
-    if (typeof json.title !== 'string' || typeof json.date !== 'string') return null;
-    if (json.date.trim().toLowerCase() === 'unknown') return null;
-    const id = Date.now().toString();
-    const loc = typeof json.location === 'string' && json.location.trim() ? json.location.trim() : undefined;
-    const city = typeof json.city === 'string' && json.city.trim() ? json.city.trim() : undefined;
-    const state = typeof json.state === 'string' && json.state.trim() ? json.state.trim() : undefined;
-    const desc = typeof json.description === 'string' && json.description.trim() ? json.description.trim() : undefined;
-    const base: CalEvent = {
-      id,
-      type: 'event',
-      title: json.title.trim(),
-      date: json.date.trim(),
-      startTime: typeof json.startTime === 'string' && json.startTime.trim() ? json.startTime.trim() : '12:00',
-      endTime: typeof json.endTime === 'string' && json.endTime.trim() ? json.endTime.trim() : '14:00',
-      isHoliday: false,
-      ...(loc ? { location: loc } : {}),
-      ...(city ? { city } : {}),
-      ...(state ? { state } : {}),
-      ...(desc ? { description: desc } : {}),
-    };
-    const uri = getEventCoverUri(base);
-    return uri ? { ...base, hostImage: uri } : base;
+    return eventFromJsonPayload(json);
+  } catch {
+    return null;
+  }
+}
+
+function tryParseEventsPayload(clean: string): CalEvent[] | null {
+  const jsonSlice = extractFirstJsonObject(clean.trim());
+  if (!jsonSlice) return null;
+  try {
+    const json = JSON.parse(jsonSlice) as { type?: unknown; events?: unknown };
+    if (json.type !== 'events' || !Array.isArray(json.events)) return null;
+    const events: CalEvent[] = [];
+    for (const item of json.events) {
+      if (!item || typeof item !== 'object') continue;
+      const ev = eventFromJsonPayload(item as EventJsonPayload, generateId());
+      if (ev) events.push(ev);
+    }
+    return events.length ? events : null;
   } catch {
     return null;
   }
@@ -117,6 +183,8 @@ function tryParseEventPayload(clean: string): CalEvent | null {
 /** Raw assistant reply → structured result for Nexa UI */
 export function parseNexaReply(text: string): NexaResult {
   const clean = text.replace(/```json|```/g, '').trim();
+  const events = tryParseEventsPayload(clean);
+  if (events) return { kind: 'events', events };
   const event = tryParseEventPayload(clean);
   if (event) return { kind: 'event', event };
   if (clean.length) return { kind: 'chat', text: clean };
@@ -281,7 +349,7 @@ function eventFromJsonLd(
   }
 
   const out: CalEvent & { imageUrl?: string } = {
-    id: Date.now().toString(),
+    id: generateId(),
     type: 'event',
     title: typeof ld.name === 'string' ? ld.name.trim() : '',
     date: `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`,
@@ -296,6 +364,7 @@ function eventFromJsonLd(
   };
 
   if (!out.title) return null;
+  if (!isValidDate(out.date) || !isValidTime(out.startTime) || !isValidTime(out.endTime)) return null;
   return out;
 }
 
@@ -421,31 +490,49 @@ export async function sendNexaEventFromUrl(pageUrl: string): Promise<NexaResult>
   return { kind: 'event', event: parsed };
 }
 
-export async function sendNexaTextMessage(userText: string): Promise<NexaResult> {
+const MAX_HISTORY_MESSAGES = 24;
+
+/** Send full conversation (user + assistant turns) to Nexa. */
+export async function sendNexaChat(history: NexaApiMessage[]): Promise<NexaChatResponse> {
+  const trimmed =
+    history.length > MAX_HISTORY_MESSAGES ? history.slice(-MAX_HISTORY_MESSAGES) : history;
   try {
-    const data = await callAPI([{ role: 'user', content: userText }]);
-    return nexaRespond(data);
+    const data = await callAPI(trimmed);
+    const result = await nexaRespond(data);
+    const assistantText = extractAssistantText(data)?.trim() ?? '';
+    if (result.kind === 'chat' && !assistantText) {
+      return { result, assistantText: result.text };
+    }
+    return { result, assistantText: assistantText || (result.kind === 'chat' ? result.text : '') };
   } catch {
-    return { kind: 'error', message: 'Network error.' };
+    return { result: { kind: 'error', message: 'Network error.' }, assistantText: '' };
   }
 }
 
-export async function sendNexaImageMessage(base64Jpeg: string, prompt?: string): Promise<NexaResult> {
-  const textPrompt = typeof prompt === 'string' && prompt.trim() ? prompt.trim() : 'Extract event details from this image, or briefly describe what you see if there is no event.';
-  try {
-    const data = await callAPI([
-      {
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Jpeg } },
-          { type: 'text', text: textPrompt },
-        ],
-      },
-    ]);
-    return nexaRespond(data);
-  } catch {
-    return { kind: 'error', message: 'Network error.' };
-  }
+export async function sendNexaTextMessage(userText: string): Promise<NexaResult> {
+  const { result } = await sendNexaChat([{ role: 'user', content: userText }]);
+  return result;
+}
+
+export async function sendNexaImageMessage(
+  base64: string,
+  prompt?: string,
+  mediaType?: AnthropicImageMediaType,
+): Promise<NexaResult> {
+  const textPrompt =
+    typeof prompt === 'string' && prompt.trim()
+      ? prompt.trim()
+      : 'What events do you see in this image? List each with title, date, and time. Ask before adding to the calendar.';
+  const { result } = await sendNexaChat([
+    {
+      role: 'user',
+      content: [
+        imageBlockFromBase64(base64, '', mediaType),
+        { type: 'text', text: textPrompt },
+      ],
+    },
+  ]);
+  return result;
 }
 
 /** @deprecated Prefer sendNexaTextMessage — returns calendar event only when model emits event JSON */

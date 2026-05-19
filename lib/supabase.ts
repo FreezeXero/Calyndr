@@ -1,10 +1,16 @@
 import { createClient } from '@supabase/supabase-js';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
-import ws from 'ws';
 
-const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL ?? '';
-const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? '';
+if (typeof global.WebSocket === 'undefined') {
+  (global as any).WebSocket = class FakeWebSocket {
+    constructor() {}
+    close() {}
+  };
+}
+
+const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!;
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
@@ -15,6 +21,11 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     flowType: 'pkce',
   },
   realtime: {
-    transport: (typeof WebSocket !== 'undefined' ? WebSocket : ws) as typeof WebSocket,
+    params: {
+      eventsPerSecond: -1,
+    },
+  },
+  global: {
+    headers: {},
   },
 });
